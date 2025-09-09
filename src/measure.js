@@ -88,7 +88,7 @@ async function startTest() {
             useThisDelayButton.style.display = 'inline';
             useThisDelayButton.onclick = () => {
                 const delayInt = Math.round(delay);
-                chrome.storage.sync.set({ frameDelay: delayInt });
+                browser.storage.sync.set({ frameDelay: delayInt });
                 alert('Delay saved.');
             };
         }

@@ -12,14 +12,18 @@
             this.Resize();
         }
         CaptureFrame(now) {
-            this.ctx.drawImage(this.video, 0, 0, this.frame.width, this.frame.height);
-            this.captureTs = now;
+            // Only draw if the video has valid dimensions
+            if (this.video.videoWidth > 0 && this.video.videoHeight > 0) {
+                this.ctx.drawImage(this.video, 0, 0, this.frame.width, this.frame.height);
+                this.captureTs = now;
+            }
         }
         Resize() {
             const frame = this.frame;
             const video = this.video;
             frame.width = video.videoWidth;
             frame.height = video.videoHeight;
+            // The context needs to be retrieved again after a resize
             this.ctx = this.frame.getContext('2d');
         }
     }
@@ -32,6 +36,8 @@
          */
         constructor(video, maxBuffer, frameDelayMs) {
             if (video.frameSyncObj) {
+                // If it already exists, just update the delay
+                video.frameSyncObj.frameDelayMs = frameDelayMs;
                 return video.frameSyncObj;
             }
 
@@ -41,17 +47,14 @@
             this.frameDelayMs = frameDelayMs;
             this.active = false;
             this.frameCount = 0;
-            this.lastDelayedFrameIndex = -1;
+            this.lastDrawnFrameIndex = -1; // Keep track of what we last drew
+            this.resizeObserver = null; // For efficient resize detection
+
             this.SetMaxBuffer(maxBuffer);
             video.frameSyncObj = this;
             this._captureFrameFunc = this._captureFrame.bind(this);
             this._drawFrameFunc = this._drawFrame.bind(this);
             this._resizeFunc = this.Resize.bind(this);
-
-            this.lastVideoOffsetWidth = video.offsetWidth;
-            this.lastVideoOffsetHeight = video.offsetHeight;
-            this.lastVideoOffsetLeft = video.offsetLeft;
-            this.lastVideoOffsetTop = video.offsetTop;
         }
 
         SetMaxBuffer(maxBuffer) {
@@ -61,156 +64,207 @@
             }
 
             this.maxBuffer = maxBuffer;
-
-            // Reuse the existing buffer frames
-            const sortedBuffer = this.buffer.filter(frame => frame.captureTs != 0).sort((a, b) => a.captureTs - b.captureTs);
-            const sortedBufferLength = sortedBuffer.length;
-            this.buffer = [...sortedBuffer];
-
-            for (let i = this.buffer.length; i < this.maxBuffer; i++) {
-                const frame = new BufferFrame(this.video);
-                this.buffer.push(frame);
+            this.buffer = []; // Re-initialize buffer
+            for (let i = 0; i < this.maxBuffer; i++) {
+                this.buffer.push(new BufferFrame(this.video));
             }
-            this.frameCount = sortedBufferLength;
-            this.lastDelayedFrameIndex = -1;
+            this.frameCount = 0;
+            this.lastDrawnFrameIndex = -1;
         }
 
         Resize = () => {
+            if (!this.canvas) return;
             const video = this.video;
             const canvas = this.canvas;
+
+            // Check if video has valid dimensions before resizing
+            if (video.videoWidth === 0 || video.videoHeight === 0) return;
+
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
-            canvas.style.width = `${video.offsetWidth}px`;
-            canvas.style.height = `${video.offsetHeight}px`;
+
+            const videoStyle = window.getComputedStyle(video);
+            canvas.style.width = videoStyle.width;
+            canvas.style.height = videoStyle.height;
             canvas.style.left = `${video.offsetLeft}px`;
             canvas.style.top = `${video.offsetTop}px`;
-
-            const videoAspect = video.videoWidth / video.videoHeight;
-            const canvasAspect = video.offsetWidth / video.offsetHeight;
-            if (Math.abs(videoAspect / canvasAspect - 1) < 0.02) {
-                // aspect ratio is close enough, do nothing
-            } else if (videoAspect > canvasAspect) {
-                canvas.style.height = `${video.offsetWidth / videoAspect}px`;
-                canvas.style.top = `${video.offsetTop + (video.offsetHeight - video.offsetWidth / videoAspect) / 2}px`;
-            } else {
-                canvas.style.width = `${video.offsetHeight * videoAspect}px`;
-                canvas.style.left = `${video.offsetLeft + (video.offsetWidth - video.offsetHeight * videoAspect) / 2}px`;
-            }
-
-            this.lastVideoOffsetWidth = video.offsetWidth;
-            this.lastVideoOffsetHeight = video.offsetHeight;
-            this.lastVideoOffsetLeft = video.offsetLeft;
-            this.lastVideoOffsetTop = video.offsetTop;
+            canvas.style.objectFit = videoStyle.objectFit;
+            canvas.style.transform = videoStyle.transform;
 
             for (let i = 0; i < this.maxBuffer; i++) {
                 this.buffer[i].Resize();
             }
         };
 
-        NeedResize() {
-            const video = this.video;
-            const canvas = this.canvas;
-            return canvas.width != video.videoWidth || canvas.height != video.videoHeight
-                || this.lastVideoOffsetWidth != video.offsetWidth || this.lastVideoOffsetHeight != video.offsetHeight
-                || this.lastVideoOffsetLeft != video.offsetLeft || this.lastVideoOffsetTop != video.offsetTop;
-        }
-
         _createCanvasOverlay() {
+            if (this.canvas) return; // Don't create if it already exists
+
             const canvas = document.createElement('canvas');
-            const ctx = canvas.getContext('2d');
             const video = this.video;
 
             canvas.style.position = 'absolute';
             const videoStyle = window.getComputedStyle(video);
-            canvas.style.zIndex = videoStyle.zIndex;
+            canvas.style.zIndex = (parseInt(videoStyle.zIndex, 10) || 0) + 1; // Ensure canvas is on top
             canvas.style.pointerEvents = 'none';
 
             video.parentElement.appendChild(canvas);
 
-            window.addEventListener('resize', this._resizeFunc);
-            video.addEventListener('resize', this._resizeFunc);
-
             this.canvas = canvas;
-            this.ctx = ctx;
+            this.ctx = canvas.getContext('2d');
             this.Resize();
+
+            // OPTIMIZATION 1: Use ResizeObserver instead of setInterval
+            this.resizeObserver = new ResizeObserver(this._resizeFunc);
+            this.resizeObserver.observe(this.video);
         }
 
         _captureFrame(now, metadata) {
-            if (this.buffer[this.frameCount % this.maxBuffer].captureTs != 0 &&
-                // A little bigger than frameDelayMs to avoid buffer overflow
-                now - this.buffer[this.frameCount % this.maxBuffer].captureTs < Math.min(this.frameDelayMs * 2, this.frameDelayMs + 500)) {
-                this.SetMaxBuffer(Math.round(this.maxBuffer * 1.5));
+            // Stop capturing if the video is paused, hidden, or the extension is inactive
+            if (!this.active || this.video.paused || document.hidden) {
+                return;
+            }
+            
+            // Check for buffer overflow without resizing aggressively
+            const nextFrameIndex = this.frameCount % this.maxBuffer;
+            if (this.buffer[nextFrameIndex].captureTs !== 0 && now - this.buffer[nextFrameIndex].captureTs < this.frameDelayMs) {
+                console.warn('FrameSync: Buffer overflow detected. Video might stutter. Consider increasing buffer or checking performance.');
+                // We just overwrite the frame instead of resizing the buffer, which is smoother.
             }
 
-            try {
-                this.buffer[this.frameCount % this.maxBuffer].CaptureFrame(now);
-            } catch (e) {
-                debugger;
-            }
+            this.buffer[nextFrameIndex].CaptureFrame(now);
             this.frameCount++;
 
-            if (this.active) {
-                this.video.requestVideoFrameCallback(this._captureFrameFunc);
+            // Continue the capture loop
+            this.video.requestVideoFrameCallback(this._captureFrameFunc);
+        }
+        
+        // OPTIMIZATION 2: Simpler and more efficient frame selection logic
+        _findBestFrameToShow(targetTs) {
+            let bestFrameIndex = -1;
+            let smallestDiff = Infinity;
+
+            // Search the buffer for the frame closest to our target timestamp
+            for (let i = 0; i < this.buffer.length; i++) {
+                const frame = this.buffer[i];
+                if (frame.captureTs === 0) continue; // Skip empty frames
+
+                const diff = Math.abs(frame.captureTs - targetTs);
+                if (diff < smallestDiff) {
+                    smallestDiff = diff;
+                    bestFrameIndex = i;
+                }
             }
+            return bestFrameIndex;
         }
 
-        _shouldShowNextFrame(now) {
-            // if (this.lastDelayedFrameIndex == -1) {
-            //     return true;
-            // }
-            // return Math.abs(now - this.buffer[(this.lastDelayedFrameIndex + 1) % this.maxBuffer].captureTs - this.frameDelayMs)
-            //     < Math.abs(now - this.buffer[(this.lastDelayedFrameIndex) % this.maxBuffer].captureTs - this.frameDelayMs);
-            return now - this.buffer[(this.lastDelayedFrameIndex + 1) % this.maxBuffer].captureTs >= this.frameDelayMs
-        }
 
         _drawFrame(now) {
-            let canSkip = false;
-            while ((this.lastDelayedFrameIndex + 1) % this.maxBuffer != this.frameCount % this.maxBuffer && this._shouldShowNextFrame(now)) {
-                this.lastDelayedFrameIndex = (this.lastDelayedFrameIndex + 1) % this.maxBuffer;
-                canSkip = true;
+            if (!this.active || this.video.paused) {
+                window.requestAnimationFrame(this._drawFrameFunc);
+                return;
             }
-            if (!canSkip) {
-                const delayedFrame = this.buffer[this.lastDelayedFrameIndex];
-                try {
-                    this.ctx.drawImage(delayedFrame.frame, 0, 0, this.video.videoWidth, this.video.videoHeight);
-                } catch (e) {
+
+            const targetTs = now - this.frameDelayMs;
+            const bestFrameIndex = this._findBestFrameToShow(targetTs);
+
+            if (bestFrameIndex !== -1 && bestFrameIndex !== this.lastDrawnFrameIndex) {
+                const frameToDraw = this.buffer[bestFrameIndex].frame;
+                if (frameToDraw.width > 0 && frameToDraw.height > 0) {
+                    try {
+                        this.ctx.drawImage(frameToDraw, 0, 0, this.canvas.width, this.canvas.height);
+                        this.lastDrawnFrameIndex = bestFrameIndex;
+                    } catch (e) {
+                        console.error('FrameSync: Error drawing frame.', e);
+                    }
                 }
             }
 
-            if (this.active) {
-                window.requestAnimationFrame(this._drawFrameFunc);
-            }
+            window.requestAnimationFrame(this._drawFrameFunc);
         }
 
         Activate() {
+            if (this.active) return;
             this.active = true;
-            this.frameCount = 0;
-            this.lastDelayedFrameIndex = -1;
             this._createCanvasOverlay();
             this.video.requestVideoFrameCallback(this._captureFrameFunc);
             window.requestAnimationFrame(this._drawFrameFunc);
         }
-    }
 
-    const frameDelay = (await chrome.storage.sync.get('frameDelay'))['frameDelay'];
-    const pauseDelay = (await chrome.storage.sync.get('pauseDelay'))['pauseDelay'];
-    if (frameDelay && !pauseDelay) {
-        const frameDelayNum = parseInt(frameDelay);
-        if (frameDelayNum > 0) {
-            setInterval(() => {
-                const videoList = document.querySelectorAll('video');
-                videoList.forEach(video => {
-                    if (!video.frameSyncObj) {
-                        // dynamically extend the max buffer size
-                        const frameSync = new FrameSync(video, 10, frameDelayNum);
-                        frameSync.Activate();
-                    } else {
-                        if (video.frameSyncObj.NeedResize()) {
-                            video.frameSyncObj.Resize();
-                        }
-                    }
-                });
-            }, 2000);
+        Deactivate() {
+            this.active = false;
+            if (this.canvas) {
+                this.canvas.remove();
+                this.canvas = null;
+            }
+            if (this.resizeObserver) {
+                this.resizeObserver.disconnect();
+                this.resizeObserver = null;
+            }
+            delete this.video.frameSyncObj;
         }
     }
+    
+    // --- Main Logic ---
+    
+    let currentFrameDelay = 0;
+    let isPaused = false;
+    
+    const updateSyncForVideos = () => {
+        const videoList = document.querySelectorAll('video');
+        videoList.forEach(video => {
+            if (currentFrameDelay > 0 && !isPaused) {
+                if (!video.frameSyncObj) {
+                    // Start with a larger buffer to prevent overflow. 60 frames is good for 1 sec at 60fps.
+                    const frameSync = new FrameSync(video, 60, currentFrameDelay);
+                    frameSync.Activate();
+                } else {
+                    // Update delay if it has changed
+                    video.frameSyncObj.frameDelayMs = currentFrameDelay;
+                }
+            } else {
+                // If delay is 0 or paused, deactivate and cleanup
+                if (video.frameSyncObj) {
+                    video.frameSyncObj.Deactivate();
+                }
+            }
+        });
+    };
+
+    // Initial setup
+    const initialize = async () => {
+        const { frameDelay, pauseDelay } = await browser.storage.sync.get(['frameDelay', 'pauseDelay']);
+        currentFrameDelay = parseInt(frameDelay, 10) || 0;
+        isPaused = pauseDelay || false;
+        updateSyncForVideos();
+    };
+
+    // Listen for changes from the popup
+    browser.storage.onChanged.addListener((changes, area) => {
+        if (area === 'sync') {
+            if (changes.frameDelay) {
+                currentFrameDelay = parseInt(changes.frameDelay.newValue, 10) || 0;
+            }
+            if (changes.pauseDelay) {
+                isPaused = changes.pauseDelay.newValue || false;
+            }
+            updateSyncForVideos();
+        }
+    });
+
+    // Run on new videos that might appear later (e.g., on single-page apps)
+    const observer = new MutationObserver((mutations) => {
+        mutations.forEach((mutation) => {
+            mutation.addedNodes.forEach((node) => {
+                if (node.tagName === 'VIDEO') {
+                    updateSyncForVideos();
+                } else if (node.querySelectorAll) {
+                    node.querySelectorAll('video').forEach(() => updateSyncForVideos());
+                }
+            });
+        });
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    initialize();
 })();
